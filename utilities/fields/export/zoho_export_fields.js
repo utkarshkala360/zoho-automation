@@ -2,17 +2,20 @@
 /**
  * Zoho CRM field metadata exporter.
  *
- * Fill in the CONFIG block below (credentials live in ../zoho_auth.js), then run:
- *     node zoho_export_fields.js                      # uses USE_SANDBOX below
+ * Fill in the CONFIG block below (credentials: .env at the repo root), then run:
+ *     node zoho_export_fields.js                      # uses ZOHO_ENV from .env (default sandbox)
  *     node zoho_export_fields.js --env production
  *     node zoho_export_fields.js --env sandbox
  *
- * For every module listed it writes, into OUTPUT_DIR/<sandbox|production>/:
+ * OUTPUT_DIR (zoho_fields_output/) only holds sandbox/ and production/. Each run empties the
+ * folder for the org being exported (the other org's folder is kept, anything else is removed),
+ * then writes, for every module listed, into OUTPUT_DIR/<sandbox|production>/:
  *     <Module>_fields.json   raw API response (everything Zoho returns)
  *     <Module>_fields.csv    flat sheet: label, API name, type, mandatory, picklist values, lookup ...
  *     all_fields.csv         every module combined
  *
- * The access token comes from ../zoho_auth.js, which caches and rotates it.
+ * API calls go through utilities/common/zoho_api.js; the access token comes from
+ * utilities/auth/zoho_auth.js, which caches and rotates it.
  *
  * No third-party packages needed (Node 18+).
  */
@@ -21,85 +24,16 @@
 
 const fs = require('fs');
 const path = require('path');
-const { DATA_CENTER, getAccessToken } = require('../auth/zoho_auth');
+const { apiGet, applyEnvArg, envName } = require('../../common/zoho_api');
 
 // ==================================================
 // CONFIG
 // ==================================================
-// Default org when --env is not passed:
-// true -> sandbox (sandbox.zohoapis.<dc>), false -> production (www.zohoapis.<dc>)
-let USE_SANDBOX = true;
-
 // Module API names. Use ['ALL'] to export every API-supported module in the org.
-const MODULES = ['Leads', 'Contacts', 'Calls'];
+const MODULES = ['Leads', 'Calls', 'Tasks'];
 
-const API_VERSION = 'v8';
 // Exports go next to this script: export/zoho_fields_output/<sandbox|production>/
 const OUTPUT_DIR = path.join(__dirname, 'zoho_fields_output');
-
-// ==================================================
-// HTTP HELPERS
-// ==================================================
-class AuthError extends Error {}
-
-async function httpRequest(url, { method = 'GET', headers = {}, jsonBody } = {}) {
-	headers = { ...headers };
-	let body;
-	if (jsonBody !== undefined && jsonBody !== null) {
-		body = JSON.stringify(jsonBody);
-		headers['Content-Type'] = 'application/json';
-	}
-
-	const resp = await fetch(url, { method, headers, body, signal: AbortSignal.timeout(60000) });
-	const raw = await resp.text();
-	if (!resp.ok) {
-		if (resp.status === 401 || raw.includes('INVALID_TOKEN') || raw.includes('AUTHENTICATION_FAILURE')) {
-			throw new AuthError(`HTTP ${resp.status} on ${url}\n${raw}`);
-		}
-		throw new Error(`HTTP ${resp.status} on ${url}\n${raw}`);
-	}
-	return raw ? JSON.parse(raw) : {};
-}
-
-function envName() {
-	return USE_SANDBOX ? 'sandbox' : 'production';
-}
-
-/** Honour `--env sandbox|production` on the command line (overrides USE_SANDBOX). */
-function applyEnvArg(argv = process.argv.slice(2)) {
-	const i = argv.indexOf('--env');
-	if (i !== -1) {
-		const value = (argv[i + 1] || '').toLowerCase();
-		if (!['sandbox', 'production', 'prod'].includes(value)) {
-			console.error("ERROR: --env must be 'sandbox' or 'production'");
-			process.exit(1);
-		}
-		USE_SANDBOX = value === 'sandbox';
-	}
-}
-
-async function apiRequest(method, apiPath, params, jsonBody) {
-	const host = USE_SANDBOX ? 'sandbox.zohoapis' : 'www.zohoapis';
-	let url = `https://${host}.${DATA_CENTER}/crm/${API_VERSION}/${apiPath}`;
-	if (params && Object.keys(params).length > 0) {
-		url += '?' + new URLSearchParams(params).toString();
-	}
-
-	const send = (token) => httpRequest(url, { method, jsonBody, headers: { Authorization: `Zoho-oauthtoken ${token}` } });
-	try {
-		return await send(await getAccessToken());
-	} catch (e) {
-		if (!(e instanceof AuthError)) {
-			throw e;
-		}
-		// Token rejected (revoked / expired early) -> rotate once and retry
-		return send(await getAccessToken({ forceRefresh: true }));
-	}
-}
-
-function apiGet(apiPath, params) {
-	return apiRequest('GET', apiPath, params);
-}
 
 // ==================================================
 // EXPORT
@@ -167,6 +101,16 @@ function writeCsv(filePath, rows) {
 
 async function main() {
 	applyEnvArg();
+
+	// OUTPUT_DIR only holds sandbox/ and production/: clear the folder for this org,
+	// keep the other org's folder (if it exists) and remove anything else
+	fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+	for (const entry of fs.readdirSync(OUTPUT_DIR, { withFileTypes: true })) {
+		const keep = entry.isDirectory() && ['sandbox', 'production'].includes(entry.name) && entry.name !== envName();
+		if (!keep) {
+			fs.rmSync(path.join(OUTPUT_DIR, entry.name), { recursive: true, force: true });
+		}
+	}
 	const outDir = path.join(OUTPUT_DIR, envName());
 	fs.mkdirSync(outDir, { recursive: true });
 	console.log(`Org : ${envName()}`);
@@ -196,8 +140,6 @@ async function main() {
 	writeCsv(path.join(outDir, 'all_fields.csv'), allRows);
 	console.log(`\nDone. ${allRows.length} fields written to ${path.resolve(outDir)}`);
 }
-
-module.exports = { apiRequest, apiGet, applyEnvArg, envName };
 
 if (require.main === module) {
 	main().catch((e) => {
