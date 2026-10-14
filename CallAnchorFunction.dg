@@ -1,0 +1,828 @@
+string standalone.CallAnchorWebhook(Map crmAPIRequest)
+{
+	// ==================================================
+	// CONFIG
+	// ==================================================
+	// Field used to detect duplicate webhooks for the same call (update instead of create)
+	callIdField = "Call_Anchor_Call_Id";
+
+	// Fields written only when a Lead is CREATED, never on update
+	createOnlyFields = {"Last_Name", "Phone", "Lead_Source"};
+
+	// Webhook timestamps (UTC) that get converted to IST before mapping
+	dateSourcePaths = {"call.startedAt", "call.dispositionScheduledAt", "disposition.submittedAt", "disposition.fields.scheduled-at"};
+
+	// --------------------------------------------------
+	// CALLS FIELD MAP   (source path -> Zoho field API name[s])
+	// Incoming, Outgoing, Missed and Rejected calls all use the same fields;
+	// direction comes from Call_Type, Answered / Rejected / Missed status from Subject + Description.
+	// Disposition is kept as free text (not the Call_Result picklist) and also
+	// written into Description.
+	// --------------------------------------------------
+	callFieldMap = Map();
+	callFieldMap.put("derived.subject", "Subject");
+	callFieldMap.put("derived.callType", "Call_Type");
+	callFieldMap.put("derived.outgoingCallStatus", "Outgoing_Call_Status");
+	callFieldMap.put("derived.callDuration", "Call_Duration");
+	callFieldMap.put("derived.callDurationSeconds", "Call_Duration_in_seconds");
+	callFieldMap.put("derived.description", "Description");
+	callFieldMap.put("derived.recordingUrl", "Voice_Recording__s");
+	callFieldMap.put("call.startedAt", "Call_Start_Time");
+	callFieldMap.put("call.id", "Call_Anchor_Call_Id");
+	callFieldMap.put("call.agentName", "Agent_Name");
+	callFieldMap.put("call.agentNumber", "Agent_Number");
+	callFieldMap.put("call.calleeName", "Callee_Name");
+	callFieldMap.put("call.calleePhone", "Callee_Phone_Number");
+	callFieldMap.put("call.dispositionLabel", "Disposition");
+	callFieldMap.put("call.dispositionNote", "Disposition_Note");
+	callFieldMap.put("call.dispositionScheduledAt", "Follow_up_Date_Time");
+
+	// callFieldMap.put("event","Webhook_Event");
+	// callFieldMap.put("hasRecording","Has_Recording");
+	// callFieldMap.put("disposition.submittedAt","Disposition_Submitted_At");
+	// callFieldMap.put("disposition.fields.outcome","");
+	// callFieldMap.put("disposition.fields.note","");
+	// callFieldMap.put("disposition.fields.scheduled-at","");
+
+	// --------------------------------------------------
+	// LEADS FIELD MAP
+	// --------------------------------------------------
+	leadFieldMap = Map();
+	leadFieldMap.put("derived.leadLastName", "Last_Name");
+	leadFieldMap.put("call.calleePhone", "Phone");
+
+	leadFieldMap.put("derived.leadSource", "Lead_Source");
+	leadFieldMap.put("call.dispositionLabel", "Last_Call_Disposition");
+	leadFieldMap.put("call.dispositionNote", "Last_Call_Note");
+	leadFieldMap.put("call.startedAt", "Last_Call_Time");
+	leadFieldMap.put("call.dispositionScheduledAt", "Next_Follow_up_Date_Time");
+	leadFieldMap.put("call.agentName", "Last_Call_Agent");
+	leadFieldMap.put("derived.recordingUrl", "Last_Call_Recording");
+
+	// leadFieldMap.put("derived.phoneLast10","Phone_Last_10");
+
+	// --------------------------------------------------
+	// CONTACTS FIELD MAP (existing contacts are update-only)
+	// --------------------------------------------------
+	contactFieldMap = Map();
+	contactFieldMap.put("call.dispositionLabel", "Last_Call_Disposition");
+	contactFieldMap.put("call.dispositionNote", "Last_Call_Note");
+	contactFieldMap.put("call.startedAt", "Last_Call_Time");
+	contactFieldMap.put("call.dispositionScheduledAt", "Next_Follow_up_Date_Time");
+	contactFieldMap.put("call.agentName", "Last_Call_Agent");
+	contactFieldMap.put("derived.recordingUrl", "Last_Call_Recording");
+
+	// contactFieldMap.put("derived.phoneLast10","Phone_Last_10");
+	leadSourceValue = "360 CallAnchor";
+
+	// Follow-up task reminder: minutes before dispositionScheduledAt (0 = at the scheduled time)
+	taskReminderMinutesBefore = 15;
+
+	// ==================================================
+	// PARSE REQUEST
+	// ==================================================
+	if (isNull(crmAPIRequest))
+	{
+		return "crmAPIRequest is null.";
+	}
+
+	crmAPIRequestMap = crmAPIRequest.toMap();
+	request_params = ifnull(crmAPIRequestMap.get("body"), "").toString();
+	if (request_params == "")
+	{
+		request_params = ifnull(crmAPIRequestMap.get("params"), "").toString();
+	}
+
+	if (request_params == "")
+	{
+		return "Request body not found.";
+	}
+
+	request_params = request_params.replaceAll("%22\"", "\"");
+	request_params = request_params.replaceAll("%22,", "\",");
+	request_params = request_params.replaceAll("%22}", "\"}");
+	request_params = request_params.replaceAll(": true,", ": \"true\",");
+	request_params = request_params.replaceAll(": true}", ": \"true\"}");
+	request_params = request_params.replaceAll(": false,", ": \"false\",");
+	request_params = request_params.replaceAll(": false}", ": \"false\"}");
+	info "RAW request_params : " + request_params;
+	requestMap = Map();
+	try
+	{
+		requestMap = request_params.toMap();
+	}
+	catch (parseEx)
+	{
+		return "Invalid JSON in request_params : " + parseEx + " | RAW : " + request_params;
+	}
+
+	callRaw = requestMap.get("call");
+	if (callRaw == null)
+	{
+		return "Call object not found.";
+	}
+
+	callData = callRaw.toString().toMap();
+
+	// ==================================================
+	// PHONE NORMALISATION (trim, digits only, last 10)
+	// ==================================================
+	rawPhone = ifnull(callData.get("calleePhone"), "").toString().trim();
+	phoneDigits = rawPhone.replaceAll("[^0-9]", "");
+	if (phoneDigits.length() < 10)
+	{
+		return "Invalid / missing callee phone : " + rawPhone;
+	}
+
+	phoneLast10 = phoneDigits.subString(phoneDigits.length() - 10, phoneDigits.length());
+
+	// ==================================================
+	// DERIVED VALUES
+	// ==================================================
+	callType = ifnull(callData.get("callType"), "").toString();
+	callId = ifnull(callData.get("id"), "").toString();
+	agentName = ifnull(callData.get("agentName"), "").toString();
+	agentNumber = ifnull(callData.get("agentNumber"), "").toString();
+	calleeName = ifnull(callData.get("calleeName"), "").toString().trim();
+	disposition = ifnull(callData.get("dispositionLabel"), "").toString();
+	note = ifnull(callData.get("dispositionNote"), "").toString();
+	recordingUrl = ifnull(callData.get("recordingUrl"), "").toString();
+	isMissed = false;
+	isRejected = false;
+	if (callType == "Missed")
+	{
+		isMissed = true;
+	}
+
+	if (callType == "Rejected")
+	{
+		isRejected = true;
+	}
+
+	isMissedOrRejected = false;
+	if (isMissed || isRejected)
+	{
+		isMissedOrRejected = true;
+	}
+
+	// Zoho Call_Type only has Outbound / Inbound / Missed -> Rejected is stored as Inbound,
+	// and the real status (Answered / Rejected / Missed) goes into Subject + Description
+	callTypeZoho = "Inbound";
+	callTypeLabel = callType;
+	callStatusText = "";
+	outgoingCallStatus = "";
+	if (callType == "Outgoing")
+	{
+		callTypeZoho = "Outbound";
+		callTypeLabel = "Outbound";
+		callStatusText = "Completed";
+		outgoingCallStatus = "Completed";
+	}
+	else if (callType == "Incoming")
+	{
+		callTypeLabel = "Inbound";
+		callStatusText = "Answered";
+	}
+	else if (isMissed)
+	{
+		callTypeZoho = "Missed";
+		callTypeLabel = "Missed";
+		callStatusText = "Missed";
+	}
+	else if (isRejected)
+	{
+		callTypeLabel = "Rejected";
+		callStatusText = "Rejected";
+	}
+
+	// Duration. Missed = 0 s / 00:00, Rejected = 1 s / 00:01 placeholder, others min 1 s
+	durationText = "";
+	callDuration = "00:00";
+	durationSeconds = 0;
+	if (isRejected)
+	{
+		durationSeconds = 1;
+		callDuration = "00:01";
+	}
+	else if (!isMissed)
+	{
+		dur = 0;
+		durRaw = callData.get("durationSeconds");
+		if (durRaw != null && durRaw.toString() != "")
+		{
+			dur = durRaw.toString().toLong();
+		}
+
+		if (dur <= 0)
+		{
+			dur = 1;
+		}
+
+		durationSeconds = dur;
+		seconds = dur % 60;
+		minutes = ((dur - seconds) / 60).toLong();
+		if (minutes < 10)
+		{
+			durationText = "0" + minutes;
+		}
+		else
+		{
+			durationText = minutes.toString();
+		}
+
+		if (seconds < 10)
+		{
+			durationText = durationText + ":0" + seconds;
+		}
+		else
+		{
+			durationText = durationText + ":" + seconds;
+		}
+
+		callDuration = durationText;
+	}
+
+	// Subject e.g. "Interested | 00:10 | Outbound"
+	subjectParts = List();
+	if (disposition != "")
+	{
+		subjectParts.add(disposition);
+	}
+
+	if (!isRejected && durationText != "")
+	{
+		subjectParts.add(durationText);
+	}
+
+	if (callTypeLabel != "")
+	{
+		subjectParts.add(callTypeLabel);
+	}
+
+	subjectText = "Follow-up Call";
+	if (subjectParts.size() > 0)
+	{
+		subjectText = subjectParts.toString(" | ");
+	}
+
+	if (isMissedOrRejected)
+	{
+		recordingUrl = "";
+	}
+
+	leadLastName = calleeName;
+	if (leadLastName == "")
+	{
+		leadLastName = "Unknown Caller " + phoneLast10;
+	}
+
+	// ==================================================
+	// BUILD SOURCE VALUE MAP (derived + resolved paths)
+	// ==================================================
+
+	src = Map();
+	src.put("derived.subject", subjectText);
+	src.put("derived.callType", callTypeZoho);
+	src.put("derived.outgoingCallStatus", outgoingCallStatus);
+	src.put("derived.callDuration", callDuration);
+	src.put("derived.callDurationSeconds", durationSeconds);
+	src.put("derived.recordingUrl", recordingUrl);
+	src.put("derived.leadLastName", leadLastName);
+	src.put("derived.leadSource", leadSourceValue);
+	src.put("derived.phoneLast10", phoneLast10);
+
+	allKeys = List();
+	allKeys.addAll(callFieldMap.keys());
+	allKeys.addAll(leadFieldMap.keys());
+	allKeys.addAll(contactFieldMap.keys());
+	for each sourcePath in allKeys
+	{
+		if (sourcePath.startsWith("derived.") || src.containsKey(sourcePath))
+		{
+			continue;
+		}
+
+		current = requestMap.toString();
+		pathFound = true;
+		for each part in sourcePath.toList(".")
+		{
+			if (!pathFound)
+			{
+				break;
+			}
+
+			pathMap = current.toMap();
+			if (pathMap != null && pathMap.get(part) != null)
+			{
+				current = pathMap.get(part).toString();
+			}
+			else
+			{
+				pathFound = false;
+			}
+		}
+
+		if (pathFound)
+		{
+			src.put(sourcePath, current);
+		}
+	}
+
+	// UTC -> IST for timestamp fields (API format + a readable copy for Description)
+	followUpDisplay = "";
+	followUpDate = "";
+	followUpRemindAt = "";
+	for each dp in dateSourcePaths
+	{
+		rawDate = src.get(dp);
+		if (rawDate != null && rawDate.toString() != "")
+		{
+			try
+			{
+				clean = rawDate.toString().replaceAll("\\.\\d+Z$", "").replaceAll("Z$", "");
+				ist = clean.toTime("yyyy-MM-dd'T'HH:mm:ss").addHour(5).addMinutes(30);
+				src.put(dp, ist.toString("yyyy-MM-dd'T'HH:mm:ss") + "+05:30");
+				if (dp == "call.dispositionScheduledAt")
+				{
+					followUpDisplay = ist.toString("dd-MMM-yyyy hh:mm a") + " IST";
+					followUpDate = ist.toString("yyyy-MM-dd");
+					followUpRemindAt = ist.addMinutes(0 - taskReminderMinutesBefore).toString("yyyy-MM-dd'T'HH:mm:ss") + "+05:30";
+				}
+			}
+			catch (dateEx)
+			{
+				info "Date conversion failed for " + dp + " : " + dateEx;
+				src.put(dp, "");
+			}
+		}
+	}
+
+	// Description (multi-line call note; disposition lives here instead of a picklist)
+	agentText = agentName;
+	if (agentNumber != "")
+	{
+		if (agentText != "")
+		{
+			agentText = agentText + " (" + agentNumber + ")";
+		}
+		else
+		{
+			agentText = agentNumber;
+		}
+	}
+
+	descLines = List();
+	descLines.add("Call Type : " + callTypeLabel);
+	if (callStatusText != "")
+	{
+		descLines.add("Call Status : " + callStatusText);
+	}
+
+	if (callDuration != "")
+	{
+		descLines.add("Duration : " + callDuration + " (" + durationSeconds + " sec)");
+	}
+
+	if (agentText != "")
+	{
+		descLines.add("Agent : " + agentText);
+	}
+
+	if (calleeName != "")
+	{
+		descLines.add("Customer : " + calleeName);
+	}
+
+	descLines.add("Phone : " + rawPhone);
+	if (disposition != "")
+	{
+		descLines.add("Disposition : " + disposition);
+	}
+
+	if (note != "")
+	{
+		descLines.add("Disposition Note : " + note);
+	}
+
+	if (followUpDisplay != "")
+	{
+		descLines.add("Follow-up : " + followUpDisplay);
+	}
+
+	if (callId != "")
+	{
+		descLines.add("Call Anchor Call ID : " + callId);
+	}
+
+	// Real line-feed character; a "\n" separator can end up stored as literal backslash-n
+	newLine = hexToText("0A");
+	src.put("derived.description", descLines.toString(newLine));
+
+	// ==================================================
+	// FIND CONTACT -> LEAD (last 10 digits match)
+	// ==================================================
+	matchedId = "";
+	matchedModule = "";
+	phoneFields = {"Phone", "Mobile"};
+
+	// Stored formats tried on Phone / Mobile (search criteria allow max 10 conditions),
+	// then the last 10 digits of each hit are verified below. Contacts are checked before Leads.
+	phoneVariants = List();
+	phoneVariants.add(phoneLast10);
+	phoneVariants.add("+91" + phoneLast10);
+	phoneVariants.add("91" + phoneLast10);
+	phoneVariants.add("0" + phoneLast10);
+	phoneVariants.add("+91 " + phoneLast10);
+	criteriaParts = List();
+	for each phoneField in phoneFields
+	{
+		for each variant in phoneVariants
+		{
+			criteriaParts.add("(" + phoneField + ":equals:" + variant + ")");
+		}
+	}
+	phoneCriteria = "(" + criteriaParts.toString(" or ") + ")";
+	info "Phone criteria : " + phoneCriteria;
+
+	candidates = List();
+	searchModules = {"Contacts", "Leads"};
+	for each searchModule in searchModules
+	{
+		searchResult = zoho.crm.searchRecords(searchModule, phoneCriteria, 1, 200);
+		info "Search " + searchModule + " : " + searchResult;
+		if (searchResult != null && searchResult.size() > 0)
+		{
+			for each rec in searchResult
+			{
+				if (rec.get("id") != null)
+				{
+					rec.put("_module", searchModule);
+					candidates.add(rec);
+				}
+			}
+		}
+	}
+
+	for each rec in candidates
+	{
+		if (matchedId != "")
+		{
+			break;
+		}
+
+		recId = ifnull(rec.get("id"), "").toString();
+		if (recId == "")
+		{
+			continue;
+		}
+
+		for each phoneField in phoneFields
+		{
+			recDigits = ifnull(rec.get(phoneField), "").toString().replaceAll("[^0-9]", "");
+			if (recDigits.length() >= 10 && recDigits.subString(recDigits.length() - 10, recDigits.length()) == phoneLast10)
+			{
+				matchedId = recId;
+				matchedModule = rec.get("_module").toString();
+				break;
+			}
+		}
+	}
+
+	info "Match : " + matchedModule + " / " + matchedId;
+
+	// ==================================================
+	// UPSERT PARENT (update Contact / Lead, or create Lead)
+	// ==================================================
+	parentAction = "";
+	if (matchedModule == "Contacts")
+	{
+		contactRecord = Map();
+		for each sourcePath in contactFieldMap.keys()
+		{
+			fieldValue = src.get(sourcePath);
+			if (fieldValue == null || fieldValue.toString() == "")
+			{
+				continue;
+			}
+
+			targetFields = contactFieldMap.get(sourcePath).toString().toList(",");
+			for each zohoField in targetFields
+			{
+				contactRecord.put(zohoField.trim(), fieldValue);
+			}
+		}
+
+		parentAction = "Contact found";
+		if (contactRecord.size() > 0)
+		{
+			contactResp = zoho.crm.updateRecord("Contacts", matchedId, contactRecord);
+			info "Contact update : " + contactResp.toString();
+			if (ifnull(contactResp.get("id"), "").toString() == "")
+			{
+				parentAction = "Contact found (update failed : " + contactResp.toString() + ")";
+			}
+		}
+	}
+	else
+	{
+		isNewLead = false;
+		if (matchedId == "")
+		{
+			isNewLead = true;
+		}
+
+		leadRecord = Map();
+		for each sourcePath in leadFieldMap.keys()
+		{
+			fieldValue = src.get(sourcePath);
+			if (fieldValue == null || fieldValue.toString() == "")
+			{
+				continue;
+			}
+
+			targetFields = leadFieldMap.get(sourcePath).toString().toList(",");
+			for each zohoField in targetFields
+			{
+				fieldName = zohoField.trim();
+				if (!isNewLead && createOnlyFields.contains(fieldName))
+				{
+					continue;
+				}
+
+				leadRecord.put(fieldName, fieldValue);
+			}
+		}
+
+		if (isNewLead)
+		{
+			leadResp = zoho.crm.createRecord("Leads", leadRecord);
+			info "Lead create : " + leadResp.toString();
+
+			// Lead_Source is a managed global picklist: if the value is rejected, create the lead without it
+			if (ifnull(leadResp.get("id"), "").toString() == "" && leadResp.toString().contains("Lead_Source"))
+			{
+				leadRecord.remove("Lead_Source");
+				leadResp = zoho.crm.createRecord("Leads", leadRecord);
+				info "Lead create (without Lead_Source) : " + leadResp.toString();
+			}
+			matchedId = ifnull(leadResp.get("id"), "").toString();
+			if (matchedId == "")
+			{
+				return "Lead creation failed : " + leadResp.toString();
+			}
+
+			matchedModule = "Leads";
+			parentAction = "Lead created";
+		}
+		else
+		{
+			parentAction = "Lead found";
+			if (leadRecord.size() > 0)
+			{
+				leadResp = zoho.crm.updateRecord("Leads", matchedId, leadRecord);
+				info "Lead update : " + leadResp.toString();
+				if (ifnull(leadResp.get("id"), "").toString() == "")
+				{
+					parentAction = "Lead found (update failed : " + leadResp.toString() + ")";
+				}
+			}
+		}
+	}
+
+	// ==================================================
+	// BUILD CALL RECORD
+	// ==================================================
+	callRecord = Map();
+	for each sourcePath in callFieldMap.keys()
+	{
+		fieldValue = src.get(sourcePath);
+		if (fieldValue == null || fieldValue.toString() == "")
+		{
+			continue;
+		}
+
+		targetFields = callFieldMap.get(sourcePath).toString().toList(",");
+		for each zohoField in targetFields
+		{
+			callRecord.put(zohoField.trim(), fieldValue);
+		}
+	}
+
+	// Contacts link through Who_Id, Leads through What_Id + $se_module
+	if (matchedModule == "Contacts")
+	{
+		callRecord.put("Who_Id", matchedId);
+	}
+	else
+	{
+		callRecord.put("What_Id", matchedId);
+		callRecord.put("$se_module", "Leads");
+	}
+
+	// ==================================================
+	// UPSERT CALL (same call id -> update, else create)
+	// ==================================================
+	existingCallId = "";
+	if (callId != "")
+	{
+		callSearch = zoho.crm.searchRecords("Calls", "(" + callIdField + ":equals:" + callId + ")", 1, 1);
+		if (callSearch != null && callSearch.size() > 0)
+		{
+			for each callRec in callSearch
+			{
+				existingCallId = ifnull(callRec.get("id"), "").toString();
+				break;
+			}
+		}
+	}
+
+	callAction = "";
+	callRecordId = "";
+	if (existingCallId != "")
+	{
+		callResp = zoho.crm.updateRecord("Calls", existingCallId, callRecord);
+		info "Call update : " + callResp.toString();
+		callRecordId = ifnull(callResp.get("id"), "").toString();
+		callAction = "Call updated";
+	}
+	else
+	{
+		callResp = zoho.crm.createRecord("Calls", callRecord);
+		info "Call create : " + callResp.toString();
+		callRecordId = ifnull(callResp.get("id"), "").toString();
+		callAction = "Call created";
+	}
+
+	if (callRecordId == "")
+	{
+		return parentAction + " (" + matchedModule + " " + matchedId + ") | Call save failed : " + callResp.toString();
+	}
+
+	// ==================================================
+	// ATTACH RECORDING FILE (new calls only, so repeat webhooks don't duplicate it)
+	// ==================================================
+	attachAction = "";
+	if (callAction == "Call created" && recordingUrl != "")
+	{
+		try
+		{
+			recFile = invokeurl
+			[
+				url :recordingUrl
+				type :GET
+			];
+			fileExt = "mp3";
+			urlPath = recordingUrl.getPrefix("?");
+			if (urlPath == null || urlPath == "")
+			{
+				urlPath = recordingUrl;
+			}
+
+			if (urlPath.toLowerCase().endsWith(".wav"))
+			{
+				fileExt = "wav";
+			}
+
+			recFile.setFileName("Recording_" + callId + "." + fileExt);
+
+			// Calls may reject attachment uploads (INVALID_REQUEST_METHOD) -> fall back to the parent Lead / Contact
+			attachResp = zoho.crm.attachFile("Calls", callRecordId, recFile);
+			info "Recording attach (Calls) : " + attachResp;
+			if (ifnull(attachResp.get("id"), "").toString() != "")
+			{
+				attachAction = " | Recording attached to Call";
+			}
+			else
+			{
+				parentAttachResp = zoho.crm.attachFile(matchedModule, matchedId, recFile);
+				info "Recording attach (" + matchedModule + ") : " + parentAttachResp;
+				if (ifnull(parentAttachResp.get("id"), "").toString() != "")
+				{
+					attachAction = " | Recording attached to " + matchedModule;
+				}
+				else
+				{
+					attachAction = " | Recording attach failed : Calls " + attachResp + " / " + matchedModule + " " + parentAttachResp;
+				}
+			}
+		}
+		catch (attachEx)
+		{
+			info "Recording attach failed : " + attachEx;
+			attachAction = " | Recording attach failed : " + attachEx;
+		}
+	}
+	else
+	{
+		info "Recording attach skipped : callAction = " + callAction + ", recordingUrl = " + recordingUrl;
+	}
+
+	// ==================================================
+	// FOLLOW-UP TASK (open task on the Lead / Contact when dispositionScheduledAt is sent)
+	// Repeat webhooks for the same call update the existing open task instead of adding another.
+	// ==================================================
+	taskAction = "";
+	if (followUpDate != "")
+	{
+		taskSubject = "Call Anchor Follow-up";
+		if (disposition != "")
+		{
+			taskSubject = taskSubject + " | " + disposition;
+		}
+
+		taskDescLines = List();
+		taskDescLines.add("Follow-up : " + followUpDisplay);
+		if (disposition != "")
+		{
+			taskDescLines.add("Disposition : " + disposition);
+		}
+
+		if (note != "")
+		{
+			taskDescLines.add("Disposition Note : " + note);
+		}
+
+		if (agentText != "")
+		{
+			taskDescLines.add("Agent : " + agentText);
+		}
+
+		taskDescLines.add("Phone : " + rawPhone);
+		callIdLine = "Call Anchor Call ID : " + callId;
+		if (callId != "")
+		{
+			taskDescLines.add(callIdLine);
+		}
+
+		taskRecord = Map();
+		taskRecord.put("Subject", taskSubject);
+		taskRecord.put("Due_Date", followUpDate);
+		taskRecord.put("Status", "Not Started");
+		taskRecord.put("Priority", "High");
+		if (followUpRemindAt != "")
+		{
+			remindAt = Map();
+			remindAt.put("ALARM", "FREQ=NONE;ACTION=EMAILANDPOPUP;TRIGGER=DATE-TIME:" + followUpRemindAt);
+			taskRecord.put("Remind_At", remindAt);
+		}
+
+		taskRecord.put("Description", taskDescLines.toString(newLine));
+		if (matchedModule == "Contacts")
+		{
+			taskRecord.put("Who_Id", matchedId);
+		}
+		else
+		{
+			taskRecord.put("What_Id", matchedId);
+			taskRecord.put("$se_module", "Leads");
+		}
+
+		existingTaskId = "";
+		if (callId != "")
+		{
+			try
+			{
+				relatedTasks = zoho.crm.getRelatedRecords("Tasks", matchedModule, matchedId);
+				for each taskRec in relatedTasks
+				{
+					taskStatus = ifnull(taskRec.get("Status"), "").toString();
+					taskDesc = ifnull(taskRec.get("Description"), "").toString();
+					if (taskStatus != "Completed" && taskDesc.contains(callIdLine))
+					{
+						existingTaskId = ifnull(taskRec.get("id"), "").toString();
+						break;
+					}
+				}
+			}
+			catch (taskSearchEx)
+			{
+				info "Related task lookup failed : " + taskSearchEx;
+			}
+		}
+
+		if (existingTaskId != "")
+		{
+			taskResp = zoho.crm.updateRecord("Tasks", existingTaskId, taskRecord);
+			info "Task update : " + taskResp.toString();
+			taskAction = " | Task updated";
+		}
+		else
+		{
+			taskResp = zoho.crm.createRecord("Tasks", taskRecord);
+			info "Task create : " + taskResp.toString();
+			taskAction = " | Task created";
+		}
+
+		taskRecordId = ifnull(taskResp.get("id"), "").toString();
+		if (taskRecordId == "")
+		{
+			taskAction = taskAction + " failed : " + taskResp.toString();
+		}
+		else
+		{
+			taskAction = taskAction + " (" + taskRecordId + ")";
+		}
+	}
+
+	return parentAction + " (" + matchedModule + " " + matchedId + ") | " + callAction + " (" + callRecordId + ")" + attachAction + taskAction;
+}
