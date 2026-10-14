@@ -1,11 +1,9 @@
 # Zoho secrets / cached tokens
-zoho_credentials.json
-.zoho_access_token.json
 .env
+.zoho_access_token.json
 
 # Generated field exports (org metadata)
 zoho_fields_output/
 
 node_modules/
-__pycache__/
 .DS_Store

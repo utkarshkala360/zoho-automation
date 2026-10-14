@@ -2,9 +2,9 @@
 /**
  * Zoho CRM bulk custom-field creator.
  *
- * Reuses the API helpers and sandbox/production switch from ../export/zoho_export_fields.js,
- * and the access token (cached + auto-rotated) from ../zoho_auth.js, so there is nothing
- * extra to configure.
+ * Uses the API helpers and sandbox/production switch from utilities/common/zoho_api.js,
+ * which takes the access token (cached + auto-rotated) from utilities/auth/zoho_auth.js,
+ * so there is nothing extra to configure.
  *
  *     node zoho_create_fields.js --env sandbox --dry-run    # preview only, creates nothing
  *     node zoho_create_fields.js --env sandbox
@@ -22,7 +22,7 @@
 'use strict';
 
 const readline = require('readline');
-const zoho = require('../export/zoho_export_fields');
+const zoho = require('../../common/zoho_api');
 
 // ==================================================
 // FIELDS TO CREATE   (module -> list of definitions)

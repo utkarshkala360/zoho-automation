@@ -1,5 +1,5 @@
 /**
- * Zoho OAuth access token provider (shared by export/ and create/).
+ * Zoho OAuth access token provider (shared by every script under utilities/).
  *
  * getAccessToken() returns the current access token:
  *   - reuses the in-memory token, else the one cached in .zoho_access_token.json
@@ -19,35 +19,50 @@ const path = require('path');
 // ==================================================
 // CONFIG
 // ==================================================
-// Credentials come from zoho_credentials.json next to this file (gitignored; copy
-// zoho_credentials.example.json), or from the ZOHO_CLIENT_ID / ZOHO_CLIENT_SECRET /
-// ZOHO_REFRESH_TOKEN / ZOHO_DATA_CENTER environment variables, which take precedence.
-const CREDENTIALS_FILE = path.join(__dirname, 'zoho_credentials.json');
+// Credentials come from the .env file at the repo root (gitignored; copy .env.example).
+// Variables already set in the shell take precedence over the file.
+const ENV_FILE = path.join(__dirname, '..', '..', '.env');
 
-function loadCredentials() {
-	let file = {};
+function loadEnvFile() {
+	let text;
 	try {
-		file = JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf8'));
+		text = fs.readFileSync(ENV_FILE, 'utf8');
 	} catch (e) {
-		// env vars only
+		return; // no .env -> shell env vars only
 	}
 
-	const creds = {
-		clientId: process.env.ZOHO_CLIENT_ID || file.client_id,
-		clientSecret: process.env.ZOHO_CLIENT_SECRET || file.client_secret,
-		refreshToken: process.env.ZOHO_REFRESH_TOKEN || file.refresh_token,
-		// Data centre of the Zoho account: "in", "com", "eu", "com.au", "jp", "ca", "sa", "com.cn"
-		dataCenter: process.env.ZOHO_DATA_CENTER || file.data_center || 'in',
-	};
-	if (!creds.clientId || !creds.clientSecret || !creds.refreshToken) {
-		throw new Error(`Zoho credentials missing: fill in ${CREDENTIALS_FILE} (see zoho_credentials.example.json) or set ZOHO_* env vars`);
+	for (const line of text.split(/\r?\n/)) {
+		const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+		if (!m || process.env[m[1]] !== undefined) {
+			continue;
+		}
+
+		let value = m[2];
+		if (/^(["']).*\1$/.test(value)) {
+			value = value.slice(1, -1);
+		} else {
+			value = value.replace(/\s+#.*$/, ''); // strip inline comment
+		}
+		process.env[m[1]] = value;
 	}
-	return creds;
 }
 
-const { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, refreshToken: REFRESH_TOKEN, dataCenter: DATA_CENTER } = loadCredentials();
+loadEnvFile();
 
-// Access token is cached next to this file (shared by export/ and create/)
+const CLIENT_ID = process.env.ZOHO_CLIENT_ID;
+const CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
+const REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
+// Data centre of the Zoho account: "in", "com", "eu", "com.au", "jp", "ca", "sa", "com.cn"
+const DATA_CENTER = process.env.ZOHO_DATA_CENTER || 'in';
+
+// Checked on first use (not at require time) so callers report it as a normal error
+function assertCredentials() {
+	if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
+		throw new Error(`Zoho credentials missing: set ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_REFRESH_TOKEN in ${path.resolve(ENV_FILE)} (see .env.example)`);
+	}
+}
+
+// Access token is cached next to this file (shared by every script under utilities/)
 const TOKEN_CACHE_FILE = path.join(__dirname, '.zoho_access_token.json');
 
 // Treat the token as expired this many seconds before Zoho actually expires it
@@ -137,6 +152,7 @@ let current = null;
 let pendingRefresh = null;
 
 async function getAccessToken({ forceRefresh = false } = {}) {
+	assertCredentials();
 	if (!forceRefresh) {
 		if (current && !isExpired(current)) {
 			return current.access_token;
