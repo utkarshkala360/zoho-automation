@@ -1,5 +1,5 @@
 /**
- * Zoho OAuth access token provider (shared by every script under utilities/).
+ * Zoho OAuth access token provider (shared by every script under utilities/ via config/zoho_api.js).
  *
  * getAccessToken() returns the current access token:
  *   - reuses the in-memory token, else the one cached in .zoho_access_token.json
@@ -21,7 +21,7 @@ const path = require('path');
 // ==================================================
 // Credentials come from the .env file at the repo root (gitignored; copy .env.example).
 // Variables already set in the shell take precedence over the file.
-const ENV_FILE = path.join(__dirname, '..', '..', '.env');
+const ENV_FILE = path.join(__dirname, '..', '.env');
 
 function loadEnvFile() {
 	let text;
@@ -62,7 +62,7 @@ function assertCredentials() {
 	}
 }
 
-// Access token is cached next to this file (shared by every script under utilities/)
+// Access token is cached next to this file (config/), shared by every script under utilities/
 const TOKEN_CACHE_FILE = path.join(__dirname, '.zoho_access_token.json');
 
 // Treat the token as expired this many seconds before Zoho actually expires it

@@ -1,17 +1,17 @@
 /**
- * Common Zoho CRM API helpers (shared by fields/export and fields/create).
+ * Common Zoho CRM API helpers (shared by the scripts under utilities/).
  *
  *   apiRequest / apiGet   authorised CRM calls; if Zoho rejects the token, rotate once and retry
  *   applyEnvArg / envName `--env sandbox|production` switch (sandbox.zohoapis vs www.zohoapis)
  *
- * The access token comes from ../auth/zoho_auth.js, which caches and rotates it.
+ * The access token comes from ./zoho_auth.js, which caches and rotates it.
  *
  * No third-party packages needed (Node 18+).
  */
 
 'use strict';
 
-const { DATA_CENTER, getAccessToken } = require('../auth/zoho_auth');
+const { DATA_CENTER, getAccessToken } = require('./zoho_auth');
 
 // ==================================================
 // CONFIG

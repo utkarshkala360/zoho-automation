@@ -14,8 +14,8 @@
  *     <Module>_fields.csv    flat sheet: label, API name, type, mandatory, picklist values, lookup ...
  *     all_fields.csv         every module combined
  *
- * API calls go through utilities/common/zoho_api.js; the access token comes from
- * utilities/auth/zoho_auth.js, which caches and rotates it.
+ * API calls go through config/zoho_api.js; the access token comes from
+ * config/zoho_auth.js, which caches and rotates it.
  *
  * No third-party packages needed (Node 18+).
  */
@@ -24,7 +24,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { apiGet, applyEnvArg, envName } = require('../../common/zoho_api');
+const { apiGet, applyEnvArg, envName } = require('../../../config/zoho_api');
 
 // ==================================================
 // CONFIG
